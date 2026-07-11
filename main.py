@@ -63,7 +63,7 @@ async def ban(ctx, member: discord.Member, *, reason="No reason provided"):
 @bot.command(name="unban")
 @commands.has_permissions(ban_members=True)
 async def unban(ctx, *, user: str):
-    # ban list isn't cached so we have to pull it every time
+    # ban list isn't cached
     banned = [entry async for entry in ctx.guild.bans()]
     user = user.strip()
 
@@ -213,7 +213,7 @@ async def reminder(ctx, duration: str, *, message: str = "Reminder!"):
 
     bot.loop.create_task(wait_and_remind())
     # TODO: this doesn't survive a restart, should probably persist these to a json
-    # file or sqlite at some point if people actually start using it
+    # file or sqlite at some point if this blows up
 
 
 @bot.command(name="cmds")
