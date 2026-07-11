@@ -24,7 +24,7 @@ A clean, reliable, and high-performance Discord bot built with **Py-Cord** desig
 
 ### 1. Clone the Repository
 ```bash
-git clone <your-repository-url>
+git clone https://github.com/iamreversecocks/Envybot.git
 cd envybot
 ```
 
