@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import re
 from pathlib import Path
@@ -13,17 +14,65 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN not found in the .env file")
 
+DEFAULT_PREFIX = "e!"
+PREFIX_FILE = Path(__file__).parent / "prefixes.json"
+
+if PREFIX_FILE.exists():
+    with open(PREFIX_FILE, "r") as f:
+        prefixes = json.load(f)
+else:
+    prefixes = {}
+
+
+def save_prefixes():
+    with open(PREFIX_FILE, "w") as f:
+        json.dump(prefixes, f, indent=2)
+
+
+def get_prefix(bot_, message):
+    if not message.guild:
+        return commands.when_mentioned_or(DEFAULT_PREFIX)(bot_, message)
+    p = prefixes.get(str(message.guild.id), DEFAULT_PREFIX)
+    return commands.when_mentioned_or(p)(bot_, message)
+
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True  # need this for userinfo lookups
 
-bot = commands.Bot(command_prefix="e!", intents=intents)
+bot = commands.Bot(command_prefix=get_prefix, intents=intents)
 
 
 @bot.command(name="ping")
 async def ping(ctx):
     latency_ms = round(bot.latency * 1000)
-    await ctx.send(f"Pong! {latency_ms}ms")
+    await ctx.send(f"pong! {latency_ms}ms")
+
+
+@bot.command(name="setprefix")
+@commands.has_permissions(manage_guild=True)
+async def setprefix(ctx, new_prefix: str = None):
+    if new_prefix is None:
+        current = prefixes.get(str(ctx.guild.id), DEFAULT_PREFIX)
+        await ctx.send(f"Current prefix is `{current}`. Usage: `{current}setprefix <new_prefix>`")
+        return
+
+    if len(new_prefix) > 5:
+        await ctx.send("too much chars max 5")
+        return
+
+    prefixes[str(ctx.guild.id)] = new_prefix
+    save_prefixes()
+    await ctx.send(f"prefix updated to `{new_prefix}`")
+
+
+@bot.command(name="resetprefix")
+@commands.has_permissions(manage_guild=True)
+async def resetprefix(ctx):
+    if str(ctx.guild.id) in prefixes:
+        del prefixes[str(ctx.guild.id)]
+        save_prefixes()
+    await ctx.send(f"Prefix reset to default `{DEFAULT_PREFIX}`")
 
 
 @bot.command(name="clear")
@@ -41,13 +90,13 @@ async def clear(ctx, amount: int = 5):
 @commands.has_permissions(kick_members=True)
 async def kick(ctx, member: discord.Member, *, reason="No reason provided"):
     if member == ctx.author:
-        await ctx.send("you can't kick yourself lol")
+        await ctx.send("I refuse.")
         return
     try:
         await member.kick(reason=reason)
         await ctx.send(f"Kicked {member.mention}. Reason: {reason}")
     except discord.Forbidden:
-        await ctx.send("I don't have permission to kick that member.")
+        await ctx.send("no perms to kick that user")
 
 
 @bot.command(name="ban")
@@ -57,7 +106,7 @@ async def ban(ctx, member: discord.Member, *, reason="No reason provided"):
         await member.ban(reason=reason, delete_message_days=0)
         await ctx.send(f"Banned {member.mention}. Reason: {reason}")
     except discord.Forbidden:
-        await ctx.send("I don't have permission to ban that member.")
+        await ctx.send("no perms to ban that user")
 
 
 @bot.command(name="unban")
@@ -195,7 +244,7 @@ def parse_duration(text):
 async def reminder(ctx, duration: str, *, message: str = "Reminder!"):
     seconds = parse_duration(duration)
     if not seconds:
-        await ctx.send("couldn't parse that, try like `10m` or `1h30m`")
+        await ctx.send("couldn't parse that, try `10m` or `1h30m`")
         return
 
     if seconds > 2592000:
@@ -218,17 +267,20 @@ async def reminder(ctx, duration: str, *, message: str = "Reminder!"):
 
 @bot.command(name="cmds")
 async def cmds(ctx):
+    prefix = prefixes.get(str(ctx.guild.id), DEFAULT_PREFIX) if ctx.guild else DEFAULT_PREFIX
     embed = discord.Embed(title="Commands", color=0x5865F2)
-    embed.add_field(name="e!ping", value="latency check", inline=False)
-    embed.add_field(name="e!clear [amount]", value="Manage Messages required, max 100", inline=False)
-    embed.add_field(name="e!kick @member [reason]", value="Kick Members required", inline=False)
-    embed.add_field(name="e!ban @member [reason]", value="Ban Members required", inline=False)
-    embed.add_field(name="e!unban <name/id/name#0000>", value="Ban Members required", inline=False)
-    embed.add_field(name="e!userinfo [@member]", value="yourself if nothing tagged", inline=False)
-    embed.add_field(name="e!serverinfo", value="", inline=False)
-    embed.add_field(name="e!roleinfo <role>", value="", inline=False)
-    embed.add_field(name='e!poll "q" ["opt"...]', value="no options = thumbs up/down", inline=False)
-    embed.add_field(name="e!reminder <10m/2h/1d> <msg>", value="30 day max", inline=False)
+    embed.add_field(name=f"{prefix}ping", value="latency check", inline=False)
+    embed.add_field(name=f"{prefix}setprefix [new_prefix]", value="Manage Server required, max 5 chars", inline=False)
+    embed.add_field(name=f"{prefix}resetprefix", value="Manage Server required", inline=False)
+    embed.add_field(name=f"{prefix}clear [amount]", value="Manage Messages required, max 100", inline=False)
+    embed.add_field(name=f"{prefix}kick @member [reason]", value="Kick Members required", inline=False)
+    embed.add_field(name=f"{prefix}ban @member [reason]", value="Ban Members required", inline=False)
+    embed.add_field(name=f"{prefix}unban <name/id/name#0000>", value="Ban Members required", inline=False)
+    embed.add_field(name=f"{prefix}userinfo [@member]", value="yourself if nothing tagged", inline=False)
+    embed.add_field(name=f"{prefix}serverinfo", value="", inline=False)
+    embed.add_field(name=f"{prefix}roleinfo <role>", value="", inline=False)
+    embed.add_field(name=f'{prefix}poll "q" ["opt"...]', value="no options = thumbs up/down", inline=False)
+    embed.add_field(name=f"{prefix}reminder <10m/2h/1d> <msg>", value="30 day max", inline=False)
     await ctx.send(embed=embed)
 
 
@@ -239,7 +291,7 @@ async def on_command_error(ctx, error):
     elif isinstance(error, commands.MissingRequiredArgument):
         await ctx.send(f"missing argument: {error.param.name}")
     elif isinstance(error, commands.BadArgument):
-        await ctx.send("couldn't find that user/role, double check it")
+        await ctx.send("couldn't find that user/role")
     elif isinstance(error, commands.CommandNotFound):
         pass
     else:
