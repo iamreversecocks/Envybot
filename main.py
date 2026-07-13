@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 
 import discord
-from discord.ext import commands
+from discord.ext import bridge, commands
 from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
@@ -40,76 +40,89 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True  # need this for userinfo lookups
 
-bot = commands.Bot(command_prefix=get_prefix, intents=intents)
+# Python 3.14 removed the auto-create fallback in asyncio.get_event_loop(),
+# but py-cord 2.6.1's Client.__init__ still calls it expecting one to exist.
+# Create and set a loop manually so that call doesn't blow up.
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
+# bridge.Bot gives every @bot.bridge_command both a e!prefix version and a /slash version
+bot = bridge.Bot(command_prefix=get_prefix, intents=intents)
 
 
-@bot.command(name="ping")
+@bot.bridge_command(name="ping")
 async def ping(ctx):
     latency_ms = round(bot.latency * 1000)
-    await ctx.send(f"pong! {latency_ms}ms")
+    await ctx.respond(f"Pong! {latency_ms}ms")
 
 
-@bot.command(name="setprefix")
+@bot.bridge_command(name="setprefix")
 @commands.has_permissions(manage_guild=True)
 async def setprefix(ctx, new_prefix: str = None):
     if new_prefix is None:
-        current = prefixes.get(str(ctx.guild.id), DEFAULT_PREFIX)
-        await ctx.send(f"Current prefix is `{current}`. Usage: `{current}setprefix <new_prefix>`")
+        cur = prefixes.get(str(ctx.guild.id), DEFAULT_PREFIX)
+        await ctx.respond(f"prefix is currently `{cur}`, do `{cur}setprefix <new>` to change it")
         return
 
     if len(new_prefix) > 5:
-        await ctx.send("too much chars max 5")
+        await ctx.respond("5 chars max")
         return
 
     prefixes[str(ctx.guild.id)] = new_prefix
     save_prefixes()
-    await ctx.send(f"prefix updated to `{new_prefix}`")
+    await ctx.respond(f"prefix is now `{new_prefix}`")
 
 
-@bot.command(name="resetprefix")
+@bot.bridge_command(name="resetprefix")
 @commands.has_permissions(manage_guild=True)
 async def resetprefix(ctx):
-    if str(ctx.guild.id) in prefixes:
-        del prefixes[str(ctx.guild.id)]
-        save_prefixes()
-    await ctx.send(f"Prefix reset to default `{DEFAULT_PREFIX}`")
+    prefixes.pop(str(ctx.guild.id), None)
+    save_prefixes()
+    await ctx.respond(f"back to default (`{DEFAULT_PREFIX}`)")
 
 
-@bot.command(name="clear")
+@bot.bridge_command(name="clear")
 @commands.has_permissions(manage_messages=True)
 async def clear(ctx, amount: int = 5):
     if amount > 100:
         amount = 100
-    deleted = await ctx.channel.purge(limit=amount + 1)  # +1 so it eats its own command message
-    # print(f"purged {len(deleted)} in #{ctx.channel.name}")
-    msg = await ctx.send(f"Deleted {len(deleted) - 1} messages.")
-    await msg.delete(delay=5)
+    # purge only works on the prefix path (interactions can't purge before responding),
+    # so for slash use just delete via history instead
+    if ctx.is_app:
+        deleted = await ctx.channel.purge(limit=amount)
+        await ctx.respond(f"Deleted {len(deleted)} messages.", ephemeral=True, delete_after=5)
+    else:
+        deleted = await ctx.channel.purge(limit=amount + 1)  # +1 so it eats its own command message
+        msg = await ctx.respond(f"Deleted {len(deleted) - 1} messages.")
+        await msg.delete(delay=5)
 
 
-@bot.command(name="kick")
+@bot.bridge_command(name="kick")
 @commands.has_permissions(kick_members=True)
 async def kick(ctx, member: discord.Member, *, reason="No reason provided"):
     if member == ctx.author:
-        await ctx.send("I refuse.")
+        await ctx.respond("I refuse")
         return
     try:
         await member.kick(reason=reason)
-        await ctx.send(f"Kicked {member.mention}. Reason: {reason}")
+        await ctx.respond(f"Kicked {member.mention}. Reason: {reason}")
     except discord.Forbidden:
-        await ctx.send("no perms to kick that user")
+        await ctx.respond("No perms to kick that user")
 
 
-@bot.command(name="ban")
+@bot.bridge_command(name="ban")
 @commands.has_permissions(ban_members=True)
 async def ban(ctx, member: discord.Member, *, reason="No reason provided"):
     try:
         await member.ban(reason=reason, delete_message_days=0)
-        await ctx.send(f"Banned {member.mention}. Reason: {reason}")
+        await ctx.respond(f"Banned {member.mention}. Reason: {reason}")
     except discord.Forbidden:
-        await ctx.send("no perms to ban that user")
+        await ctx.respond("No perms to ban that user")
 
 
-@bot.command(name="unban")
+@bot.bridge_command(name="unban")
 @commands.has_permissions(ban_members=True)
 async def unban(ctx, *, user: str):
     # ban list isn't cached
@@ -144,14 +157,14 @@ async def unban(ctx, *, user: str):
                 break
 
     if match is None:
-        await ctx.send(f"couldn't find `{user}` in the ban list")
+        await ctx.respond(f"couldn't find `{user}` in the ban list")
         return
 
     await ctx.guild.unban(match.user, reason=f"Unbanned by {ctx.author}")
-    await ctx.send(f"Unbanned {match.user}.")
+    await ctx.respond(f"Unbanned {match.user}.")
 
 
-@bot.command(name="userinfo")
+@bot.bridge_command(name="userinfo")
 async def userinfo(ctx, member: discord.Member = None):
     if member is None:
         member = ctx.author
@@ -165,10 +178,10 @@ async def userinfo(ctx, member: discord.Member = None):
     roles = [r.name for r in member.roles if r.name != "@everyone"]
     embed.add_field(name="Roles", value=", ".join(roles[:5]) if roles else "None", inline=False)
 
-    await ctx.send(embed=embed)
+    await ctx.respond(embed=embed)
 
 
-@bot.command(name="serverinfo")
+@bot.bridge_command(name="serverinfo")
 async def serverinfo(ctx):
     guild = ctx.guild
     embed = discord.Embed(title=guild.name, color=0xFFAA00)
@@ -178,10 +191,10 @@ async def serverinfo(ctx):
     embed.add_field(name="Members", value=str(guild.member_count), inline=True)
     embed.add_field(name="Created", value=guild.created_at.strftime("%b %d, %Y"), inline=False)
     embed.set_footer(text=f"ID: {guild.id}")
-    await ctx.send(embed=embed)
+    await ctx.respond(embed=embed)
 
 
-@bot.command(name="roleinfo")
+@bot.bridge_command(name="roleinfo")
 async def roleinfo(ctx, *, role: discord.Role):
     embed = discord.Embed(title=role.name, color=role.color)
     embed.add_field(name="ID", value=str(role.id))
@@ -197,21 +210,23 @@ async def roleinfo(ctx, *, role: discord.Role):
             perms = "None"
     embed.add_field(name="Permissions", value=perms[:1000], inline=False)
 
-    await ctx.send(embed=embed)
+    await ctx.respond(embed=embed)
 
 
 NUMBERS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
 
 
-@bot.command(name="poll")
-async def poll(ctx, question: str, *options: str):
-    if len(options) > 10:
-        await ctx.send("max 10 options")
-        return
+@bot.bridge_command(name="poll")
+async def poll(
+    ctx, question: str,
+    opt1: str = None, opt2: str = None, opt3: str = None, opt4: str = None, opt5: str = None,
+    opt6: str = None, opt7: str = None, opt8: str = None, opt9: str = None, opt10: str = None,
+):
+    options = [o for o in (opt1, opt2, opt3, opt4, opt5, opt6, opt7, opt8, opt9, opt10) if o]
 
     if not options:
         embed = discord.Embed(title=question, color=0x5865F2)
-        msg = await ctx.send(embed=embed)
+        msg = await ctx.respond(embed=embed)
         await msg.add_reaction("👍")
         await msg.add_reaction("👎")
         return
@@ -221,7 +236,7 @@ async def poll(ctx, question: str, *options: str):
         desc += f"{NUMBERS[i]} {opt}\n"
 
     embed = discord.Embed(title=question, description=desc, color=0x5865F2)
-    msg = await ctx.send(embed=embed)
+    msg = await ctx.respond(embed=embed)
     for i in range(len(options)):
         await msg.add_reaction(NUMBERS[i])
 
@@ -240,18 +255,18 @@ def parse_duration(text):
     return total
 
 
-@bot.command(name="reminder", aliases=["remindme"])
+@bot.bridge_command(name="reminder", aliases=["remindme"])
 async def reminder(ctx, duration: str, *, message: str = "Reminder!"):
     seconds = parse_duration(duration)
     if not seconds:
-        await ctx.send("couldn't parse that, try `10m` or `1h30m`")
+        await ctx.respond("couldn't parse that, try `10m` or `1h30m`")
         return
 
     if seconds > 2592000:
-        await ctx.send("30 days max")
+        await ctx.respond("30 days max")
         return
 
-    await ctx.send(f"ok, reminding you in {duration}")
+    await ctx.respond(f"ok, reminding you in {duration}")
 
     async def wait_and_remind():
         await asyncio.sleep(seconds)
@@ -265,12 +280,12 @@ async def reminder(ctx, duration: str, *, message: str = "Reminder!"):
     # file or sqlite at some point if this blows up
 
 
-@bot.command(name="cmds")
+@bot.bridge_command(name="cmds")
 async def cmds(ctx):
     prefix = prefixes.get(str(ctx.guild.id), DEFAULT_PREFIX) if ctx.guild else DEFAULT_PREFIX
-    embed = discord.Embed(title="Commands", color=0x5865F2)
+    embed = discord.Embed(title="Commands", description="also all work as /slash commands", color=0x5865F2)
     embed.add_field(name=f"{prefix}ping", value="latency check", inline=False)
-    embed.add_field(name=f"{prefix}setprefix [new_prefix]", value="Manage Server required, max 5 chars", inline=False)
+    embed.add_field(name=f"{prefix}setprefix [new]", value="Manage Server required, 5 chars max", inline=False)
     embed.add_field(name=f"{prefix}resetprefix", value="Manage Server required", inline=False)
     embed.add_field(name=f"{prefix}clear [amount]", value="Manage Messages required, max 100", inline=False)
     embed.add_field(name=f"{prefix}kick @member [reason]", value="Kick Members required", inline=False)
@@ -279,9 +294,9 @@ async def cmds(ctx):
     embed.add_field(name=f"{prefix}userinfo [@member]", value="yourself if nothing tagged", inline=False)
     embed.add_field(name=f"{prefix}serverinfo", value="", inline=False)
     embed.add_field(name=f"{prefix}roleinfo <role>", value="", inline=False)
-    embed.add_field(name=f'{prefix}poll "q" ["opt"...]', value="no options = thumbs up/down", inline=False)
+    embed.add_field(name=f'{prefix}poll "q" ["opt"...]', value="no options = thumbs up/down, up to 10 options", inline=False)
     embed.add_field(name=f"{prefix}reminder <10m/2h/1d> <msg>", value="30 day max", inline=False)
-    await ctx.send(embed=embed)
+    await ctx.respond(embed=embed)
 
 
 @bot.event
@@ -296,7 +311,18 @@ async def on_command_error(ctx, error):
         pass
     else:
         print(error)
-        await ctx.send("something broke, check the logs")
+        await ctx.send("something broke")
+
+
+@bot.event
+async def on_application_command_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.respond(f"missing perms: {', '.join(error.missing_permissions)}", ephemeral=True)
+    elif isinstance(error, commands.BadArgument):
+        await ctx.respond("couldn't find that user/role", ephemeral=True)
+    else:
+        print(error)
+        await ctx.respond("something broke", ephemeral=True)
 
 
 @bot.event
