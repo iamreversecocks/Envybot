@@ -133,7 +133,9 @@ async def clear(ctx, amount: int = 5):
     else:
         # +1 so the command eats itself
         deleted = await ctx.channel.purge(limit=amount + 1)
-        msg = await ctx.respond(f"Deleted {len(deleted) - 1} messages.")
+        # can't ctx.respond() here - it replies to the invoking message,
+        # which we just purged, so Discord rejects the reference
+        msg = await ctx.channel.send(f"Deleted {len(deleted) - 1} messages.")
         await msg.delete(delay=5)
 
     await post_mod_log(
@@ -177,7 +179,7 @@ async def kick(ctx, member: discord.Member, *, reason="No reason provided"):
 @commands.has_permissions(ban_members=True)
 async def ban(ctx, member: discord.Member, *, reason="No reason provided"):
     try:
-        await member.ban(reason=reason, delete_message_days=0)
+        await member.ban(reason=reason, delete_message_seconds=0)
         await ctx.respond(f"banned {member.mention}. Reason: {reason}")
     except discord.Forbidden:
         await ctx.respond("no perms to ban that user")
