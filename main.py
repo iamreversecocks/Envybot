@@ -2,6 +2,8 @@ import asyncio
 import json
 import os
 import re
+import uuid
+from datetime import timedelta
 from pathlib import Path
 
 import discord
@@ -16,17 +18,25 @@ if not DISCORD_TOKEN:
 
 DEFAULT_PREFIX = "e!"
 PREFIX_FILE = Path(__file__).parent / "prefixes.json"
-
-if PREFIX_FILE.exists():
-    with open(PREFIX_FILE, "r") as f:
-        prefixes = json.load(f)
-else:
-    prefixes = {}
+LOG_CHANNEL_FILE = Path(__file__).parent / "log_channels.json"
+REMINDER_FILE = Path(__file__).parent / "reminders.json"
 
 
-def save_prefixes():
-    with open(PREFIX_FILE, "w") as f:
-        json.dump(prefixes, f, indent=2)
+def load_json(path, default):
+    if not path.exists():
+        return default
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def save_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+prefixes = load_json(PREFIX_FILE, {})
+log_channels = load_json(LOG_CHANNEL_FILE, {})
+reminders = load_json(REMINDER_FILE, [])
 
 
 def get_prefix(bot_, message):
@@ -38,24 +48,21 @@ def get_prefix(bot_, message):
 
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True  # need this for userinfo lookups
+intents.members = True
 
-# Python 3.14 removed the auto-create fallback in asyncio.get_event_loop(),
-# but py-cord 2.6.1's Client.__init__ still calls it expecting one to exist.
-# Create and set a loop manually so that call doesn't blow up.
+# prob not needed but doesnt hurt to have it in
 try:
     asyncio.get_event_loop()
 except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
-# bridge.Bot gives every @bot.bridge_command both a e!prefix version and a /slash version
 bot = bridge.Bot(command_prefix=get_prefix, intents=intents)
 
 
 @bot.bridge_command(name="ping")
 async def ping(ctx):
     latency_ms = round(bot.latency * 1000)
-    await ctx.respond(f"Pong! {latency_ms}ms")
+    await ctx.respond(f"pong! {latency_ms}ms")
 
 
 @bot.bridge_command(name="setprefix")
@@ -63,7 +70,9 @@ async def ping(ctx):
 async def setprefix(ctx, new_prefix: str = None):
     if new_prefix is None:
         cur = prefixes.get(str(ctx.guild.id), DEFAULT_PREFIX)
-        await ctx.respond(f"prefix is currently `{cur}`, do `{cur}setprefix <new>` to change it")
+        await ctx.respond(
+            f"prefix is currently `{cur}`, do `{cur}setprefix <new>` to change it"
+        )
         return
 
     if len(new_prefix) > 5:
@@ -71,7 +80,7 @@ async def setprefix(ctx, new_prefix: str = None):
         return
 
     prefixes[str(ctx.guild.id)] = new_prefix
-    save_prefixes()
+    save_json(PREFIX_FILE, prefixes)
     await ctx.respond(f"prefix is now `{new_prefix}`")
 
 
@@ -79,7 +88,7 @@ async def setprefix(ctx, new_prefix: str = None):
 @commands.has_permissions(manage_guild=True)
 async def resetprefix(ctx):
     prefixes.pop(str(ctx.guild.id), None)
-    save_prefixes()
+    save_json(PREFIX_FILE, prefixes)
     await ctx.respond(f"back to default (`{DEFAULT_PREFIX}`)")
 
 
@@ -88,13 +97,15 @@ async def resetprefix(ctx):
 async def clear(ctx, amount: int = 5):
     if amount > 100:
         amount = 100
-    # purge only works on the prefix path (interactions can't purge before responding),
-    # so for slash use just delete via history instead
+
     if ctx.is_app:
         deleted = await ctx.channel.purge(limit=amount)
-        await ctx.respond(f"Deleted {len(deleted)} messages.", ephemeral=True, delete_after=5)
+        await ctx.respond(
+            f"Deleted {len(deleted)} messages.", ephemeral=True, delete_after=5
+        )
     else:
-        deleted = await ctx.channel.purge(limit=amount + 1)  # +1 so it eats its own command message
+        # +1 so the command eats itself
+        deleted = await ctx.channel.purge(limit=amount + 1)
         msg = await ctx.respond(f"Deleted {len(deleted) - 1} messages.")
         await msg.delete(delay=5)
 
@@ -107,9 +118,9 @@ async def kick(ctx, member: discord.Member, *, reason="No reason provided"):
         return
     try:
         await member.kick(reason=reason)
-        await ctx.respond(f"Kicked {member.mention}. Reason: {reason}")
+        await ctx.respond(f"kicked {member.mention}. Reason: {reason}")
     except discord.Forbidden:
-        await ctx.respond("No perms to kick that user")
+        await ctx.respond("no perms to kick that user")
 
 
 @bot.bridge_command(name="ban")
@@ -117,20 +128,55 @@ async def kick(ctx, member: discord.Member, *, reason="No reason provided"):
 async def ban(ctx, member: discord.Member, *, reason="No reason provided"):
     try:
         await member.ban(reason=reason, delete_message_days=0)
-        await ctx.respond(f"Banned {member.mention}. Reason: {reason}")
+        await ctx.respond(f"banned {member.mention}. Reason: {reason}")
     except discord.Forbidden:
-        await ctx.respond("No perms to ban that user")
+        await ctx.respond("no perms to ban that user")
+
+
+@bot.bridge_command(name="mute")
+@commands.has_permissions(moderate_members=True)
+async def mute(
+    ctx, member: discord.Member, duration: str, *, reason="No reason provided"
+):
+    if member == ctx.author:
+        await ctx.respond("I refuse")
+        return
+
+    seconds = parse_duration(duration)
+    if not seconds:
+        await ctx.respond("couldn't parse that, try `10m` or `1h30m`")
+        return
+
+    # discord's hard limit on timeouts is 28 days
+    if seconds > 2419200:
+        seconds = 2419200
+
+    try:
+        until = discord.utils.utcnow() + timedelta(seconds=seconds)
+        await member.timeout(until, reason=reason)
+        await ctx.respond(f"Muted {member.mention} for {duration}. Reason: {reason}")
+    except discord.Forbidden:
+        await ctx.respond("No perms to timeout that user")
+
+
+@bot.bridge_command(name="unmute")
+@commands.has_permissions(moderate_members=True)
+async def unmute(ctx, member: discord.Member):
+    try:
+        await member.timeout(None, reason=f"Unmuted by {ctx.author}")
+        await ctx.respond(f"Unmuted {member.mention}.")
+    except discord.Forbidden:
+        await ctx.respond("No perms to unmute that user")
 
 
 @bot.bridge_command(name="unban")
 @commands.has_permissions(ban_members=True)
 async def unban(ctx, *, user: str):
-    # ban list isn't cached
     banned = [entry async for entry in ctx.guild.bans()]
     user = user.strip()
 
-    mention_match = re.match(r"<@!?(\d+)>$", user)
     match = None
+    mention_match = re.match(r"<@!?(\d+)>$", user)
 
     if mention_match:
         uid = int(mention_match.group(1))
@@ -166,17 +212,24 @@ async def unban(ctx, *, user: str):
 
 @bot.bridge_command(name="userinfo")
 async def userinfo(ctx, member: discord.Member = None):
-    if member is None:
-        member = ctx.author
+    member = member or ctx.author
 
     embed = discord.Embed(title=f"{member.display_name}'s Details", color=0x00AAFF)
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.add_field(name="Tag", value=str(member), inline=True)
-    embed.add_field(name="Account Created", value=member.created_at.strftime("%b %d, %Y"), inline=True)
-    embed.add_field(name="Joined Server", value=member.joined_at.strftime("%b %d, %Y"), inline=True)
+    embed.add_field(
+        name="Account Created",
+        value=member.created_at.strftime("%b %d, %Y"),
+        inline=True,
+    )
+    embed.add_field(
+        name="Joined Server", value=member.joined_at.strftime("%b %d, %Y"), inline=True
+    )
 
     roles = [r.name for r in member.roles if r.name != "@everyone"]
-    embed.add_field(name="Roles", value=", ".join(roles[:5]) if roles else "None", inline=False)
+    embed.add_field(
+        name="Roles", value=", ".join(roles[:5]) if roles else "None", inline=False
+    )
 
     await ctx.respond(embed=embed)
 
@@ -185,11 +238,19 @@ async def userinfo(ctx, member: discord.Member = None):
 async def serverinfo(ctx):
     guild = ctx.guild
     embed = discord.Embed(title=guild.name, color=0xFFAA00)
+
     if guild.icon:
         embed.set_thumbnail(url=guild.icon.url)
-    embed.add_field(name="Owner", value=guild.owner.mention if guild.owner else "unknown", inline=True)
+
+    embed.add_field(
+        name="Owner",
+        value=guild.owner.mention if guild.owner else "unknown",
+        inline=True,
+    )
     embed.add_field(name="Members", value=str(guild.member_count), inline=True)
-    embed.add_field(name="Created", value=guild.created_at.strftime("%b %d, %Y"), inline=False)
+    embed.add_field(
+        name="Created", value=guild.created_at.strftime("%b %d, %Y"), inline=False
+    )
     embed.set_footer(text=f"ID: {guild.id}")
     await ctx.respond(embed=embed)
 
@@ -205,12 +266,75 @@ async def roleinfo(ctx, *, role: discord.Role):
     if role.permissions.administrator:
         perms = "Administrator"
     else:
-        perms = ", ".join(p.replace("_", " ").title() for p, val in role.permissions if val)
+        perms = ", ".join(
+            p.replace("_", " ").title() for p, val in role.permissions if val
+        )
         if not perms:
             perms = "None"
-    embed.add_field(name="Permissions", value=perms[:1000], inline=False)
 
+    embed.add_field(name="Permissions", value=perms[:1000], inline=False)
     await ctx.respond(embed=embed)
+
+
+@bot.bridge_command(name="setlogchannel")
+@commands.has_permissions(manage_guild=True)
+async def setlogchannel(ctx, channel: discord.TextChannel = None):
+    channel = channel or ctx.channel
+    log_channels[str(ctx.guild.id)] = channel.id
+    save_json(LOG_CHANNEL_FILE, log_channels)
+    await ctx.respond(f"Warn logs will be posted in {channel.mention}")
+
+
+@bot.bridge_command(name="warn")
+@commands.has_permissions(moderate_members=True)
+async def warn(ctx, member: discord.Member, *, reason="No reason provided"):
+    # warns aren't persisted anywhere, just posted to the log channel.
+    # good enough for now, might add a proper warn history later
+    log_channel_id = log_channels.get(str(ctx.guild.id))
+    if log_channel_id is None:
+        await ctx.respond(
+            "No log channel set yet, use `e!setlogchannel #channel` first"
+        )
+        return
+
+    log_channel = ctx.guild.get_channel(log_channel_id)
+    if log_channel is None:
+        await ctx.respond(
+            "Configured log channel no longer exists, set a new one with `e!setlogchannel`"
+        )
+        return
+
+    embed = discord.Embed(title="Member Warned", color=0xFFCC00)
+    embed.add_field(name="Member", value=f"{member.mention} ({member})", inline=False)
+    embed.add_field(name="Warned by", value=ctx.author.mention, inline=False)
+    embed.add_field(name="Reason", value=reason, inline=False)
+    embed.timestamp = discord.utils.utcnow()
+
+    try:
+        await log_channel.send(embed=embed)
+    except discord.Forbidden:
+        await ctx.respond(
+            "Couldn't post in the log channel, check my permissions there"
+        )
+        return
+
+    await ctx.respond(f"Warned {member.mention}. Logged in {log_channel.mention}.")
+
+
+@bot.bridge_command(name="slowmode")
+@commands.has_permissions(manage_channels=True)
+async def slowmode(ctx, seconds: int = 10):
+    channel = ctx.channel
+
+    # toggle off if it's already on
+    if channel.slowmode_delay > 0:
+        await channel.edit(slowmode_delay=0)
+        await ctx.respond("Slowmode disabled.")
+        return
+
+    seconds = max(0, min(seconds, 21600))  # max
+    await channel.edit(slowmode_delay=seconds)
+    await ctx.respond(f"Slowmode set to {seconds}s. Run again to disable.")
 
 
 NUMBERS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
@@ -218,11 +342,22 @@ NUMBERS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7�
 
 @bot.bridge_command(name="poll")
 async def poll(
-    ctx, question: str,
-    opt1: str = None, opt2: str = None, opt3: str = None, opt4: str = None, opt5: str = None,
-    opt6: str = None, opt7: str = None, opt8: str = None, opt9: str = None, opt10: str = None,
+    ctx,
+    question: str,
+    opt1: str = None,
+    opt2: str = None,
+    opt3: str = None,
+    opt4: str = None,
+    opt5: str = None,
+    opt6: str = None,
+    opt7: str = None,
+    opt8: str = None,
+    opt9: str = None,
+    opt10: str = None,
 ):
-    options = [o for o in (opt1, opt2, opt3, opt4, opt5, opt6, opt7, opt8, opt9, opt10) if o]
+    options = [
+        o for o in (opt1, opt2, opt3, opt4, opt5, opt6, opt7, opt8, opt9, opt10) if o
+    ]
 
     if not options:
         embed = discord.Embed(title=question, color=0x5865F2)
@@ -249,10 +384,32 @@ def parse_duration(text):
     matches = DURATION_RE.findall(text.lower())
     if not matches:
         return None
+
     total = 0
     for num, unit in matches:
         total += int(num) * UNITS[unit]
     return total
+
+
+def schedule_reminder(entry):
+    delay = max(entry["fire_at"] - discord.utils.utcnow().timestamp(), 0)
+
+    async def wait_and_remind():
+        await asyncio.sleep(delay)
+
+        channel = bot.get_channel(entry["channel_id"])
+        if channel is not None:
+            try:
+                await channel.send(
+                    f"<@{entry['user_id']}> reminder: {entry['message']}"
+                )
+            except discord.Forbidden:
+                pass
+
+        reminders[:] = [r for r in reminders if r["id"] != entry["id"]]
+        save_json(REMINDER_FILE, reminders)
+
+    bot.loop.create_task(wait_and_remind())
 
 
 @bot.bridge_command(name="reminder", aliases=["remindme"])
@@ -262,40 +419,98 @@ async def reminder(ctx, duration: str, *, message: str = "Reminder!"):
         await ctx.respond("couldn't parse that, try `10m` or `1h30m`")
         return
 
-    if seconds > 2592000:
+    if seconds > 2592000:  # max
         await ctx.respond("30 days max")
         return
 
+    entry = {
+        "id": str(uuid.uuid4()),
+        "user_id": ctx.author.id,
+        "channel_id": ctx.channel.id,
+        "fire_at": discord.utils.utcnow().timestamp() + seconds,
+        "message": message,
+    }
+    reminders.append(entry)
+    save_json(REMINDER_FILE, reminders)
+
     await ctx.respond(f"ok, reminding you in {duration}")
-
-    async def wait_and_remind():
-        await asyncio.sleep(seconds)
-        try:
-            await ctx.send(f"{ctx.author.mention} reminder: {message}")
-        except discord.Forbidden:
-            pass
-
-    bot.loop.create_task(wait_and_remind())
-    # TODO: this doesn't survive a restart, should probably persist these to a json
-    # file or sqlite at some point if this blows up
+    schedule_reminder(entry)
 
 
 @bot.bridge_command(name="cmds")
 async def cmds(ctx):
-    prefix = prefixes.get(str(ctx.guild.id), DEFAULT_PREFIX) if ctx.guild else DEFAULT_PREFIX
-    embed = discord.Embed(title="Commands", description="also all work as /slash commands", color=0x5865F2)
+    prefix = (
+        prefixes.get(str(ctx.guild.id), DEFAULT_PREFIX) if ctx.guild else DEFAULT_PREFIX
+    )
+
+    embed = discord.Embed(
+        title="Commands", description="also all work as /slash commands", color=0x5865F2
+    )
     embed.add_field(name=f"{prefix}ping", value="latency check", inline=False)
-    embed.add_field(name=f"{prefix}setprefix [new]", value="Manage Server required, 5 chars max", inline=False)
-    embed.add_field(name=f"{prefix}resetprefix", value="Manage Server required", inline=False)
-    embed.add_field(name=f"{prefix}clear [amount]", value="Manage Messages required, max 100", inline=False)
-    embed.add_field(name=f"{prefix}kick @member [reason]", value="Kick Members required", inline=False)
-    embed.add_field(name=f"{prefix}ban @member [reason]", value="Ban Members required", inline=False)
-    embed.add_field(name=f"{prefix}unban <name/id/name#0000>", value="Ban Members required", inline=False)
-    embed.add_field(name=f"{prefix}userinfo [@member]", value="yourself if nothing tagged", inline=False)
+    embed.add_field(
+        name=f"{prefix}setprefix [new]",
+        value="Manage Server required, 5 chars max",
+        inline=False,
+    )
+    embed.add_field(
+        name=f"{prefix}resetprefix", value="Manage Server required", inline=False
+    )
+    embed.add_field(
+        name=f"{prefix}clear [amount]",
+        value="Manage Messages required, max 100",
+        inline=False,
+    )
+    embed.add_field(
+        name=f"{prefix}kick @member [reason]",
+        value="Kick Members required",
+        inline=False,
+    )
+    embed.add_field(
+        name=f"{prefix}ban @member [reason]", value="Ban Members required", inline=False
+    )
+    embed.add_field(
+        name=f"{prefix}unban <name/id/name#0000>",
+        value="Ban Members required",
+        inline=False,
+    )
+    embed.add_field(
+        name=f"{prefix}mute @member <10m/2h/1d> [reason]",
+        value="Moderate Members required, 28 day max",
+        inline=False,
+    )
+    embed.add_field(
+        name=f"{prefix}unmute @member", value="Moderate Members required", inline=False
+    )
+    embed.add_field(
+        name=f"{prefix}warn @member [reason]",
+        value="Moderate Members required, posts to the log channel (not stored)",
+        inline=False,
+    )
+    embed.add_field(
+        name=f"{prefix}setlogchannel [#channel]",
+        value="Manage Server required, sets where warns are posted",
+        inline=False,
+    )
+    embed.add_field(
+        name=f"{prefix}slowmode [seconds]",
+        value="Manage Channels required, run again to disable, default 10s",
+        inline=False,
+    )
+    embed.add_field(
+        name=f"{prefix}userinfo [@member]",
+        value="yourself if nothing tagged",
+        inline=False,
+    )
     embed.add_field(name=f"{prefix}serverinfo", value="", inline=False)
     embed.add_field(name=f"{prefix}roleinfo <role>", value="", inline=False)
-    embed.add_field(name=f'{prefix}poll "q" ["opt"...]', value="no options = thumbs up/down, up to 10 options", inline=False)
-    embed.add_field(name=f"{prefix}reminder <10m/2h/1d> <msg>", value="30 day max", inline=False)
+    embed.add_field(
+        name=f'{prefix}poll "q" ["opt"...]',
+        value="no options = thumbs up/down, up to 10 options",
+        inline=False,
+    )
+    embed.add_field(
+        name=f"{prefix}reminder <10m/2h/1d> <msg>", value="30 day max", inline=False
+    )
     await ctx.respond(embed=embed)
 
 
@@ -317,7 +532,9 @@ async def on_command_error(ctx, error):
 @bot.event
 async def on_application_command_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
-        await ctx.respond(f"missing perms: {', '.join(error.missing_permissions)}", ephemeral=True)
+        await ctx.respond(
+            f"missing perms: {', '.join(error.missing_permissions)}", ephemeral=True
+        )
     elif isinstance(error, commands.BadArgument):
         await ctx.respond("couldn't find that user/role", ephemeral=True)
     else:
@@ -328,6 +545,14 @@ async def on_application_command_error(ctx, error):
 @bot.event
 async def on_ready():
     print(f"logged in as {bot.user}")
+
+    # Wait until the internal cache is fully loaded
+    await bot.wait_until_ready()
+
+    for entry in list(reminders):
+        schedule_reminder(entry)
+    if reminders:
+        print(f"rescheduled {len(reminders)} pending reminder(s)")
 
 
 bot.run(DISCORD_TOKEN)
