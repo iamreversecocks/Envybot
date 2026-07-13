@@ -92,6 +92,33 @@ async def resetprefix(ctx):
     await ctx.respond(f"back to default (`{DEFAULT_PREFIX}`)")
 
 
+def get_log_channel(ctx):
+    log_channel_id = log_channels.get(str(ctx.guild.id))
+    if log_channel_id is None:
+        return None
+    return ctx.guild.get_channel(log_channel_id)
+
+
+async def post_mod_log(ctx, *, title, color, fields):
+    """Best-effort post of a moderation action embed to the configured log channel.
+    Silently does nothing if no log channel is set or the bot can't post there.
+    """
+    channel = get_log_channel(ctx)
+    if channel is None:
+        return
+
+    embed = discord.Embed(title=title, color=color)
+    for name, value in fields:
+        embed.add_field(name=name, value=value, inline=False)
+    embed.set_footer(text=f"Action by {ctx.author}")
+    embed.timestamp = discord.utils.utcnow()
+
+    try:
+        await channel.send(embed=embed)
+    except discord.Forbidden:
+        pass
+
+
 @bot.bridge_command(name="clear")
 @commands.has_permissions(manage_messages=True)
 async def clear(ctx, amount: int = 5):
@@ -109,6 +136,17 @@ async def clear(ctx, amount: int = 5):
         msg = await ctx.respond(f"Deleted {len(deleted) - 1} messages.")
         await msg.delete(delay=5)
 
+    await post_mod_log(
+        ctx,
+        title="Messages Cleared",
+        color=0x99AAB5,
+        fields=[
+            ("Channel", ctx.channel.mention),
+            ("Amount", str(amount)),
+            ("Cleared by", ctx.author.mention),
+        ],
+    )
+
 
 @bot.bridge_command(name="kick")
 @commands.has_permissions(kick_members=True)
@@ -121,6 +159,18 @@ async def kick(ctx, member: discord.Member, *, reason="No reason provided"):
         await ctx.respond(f"kicked {member.mention}. Reason: {reason}")
     except discord.Forbidden:
         await ctx.respond("no perms to kick that user")
+        return
+
+    await post_mod_log(
+        ctx,
+        title="Member Kicked",
+        color=0xFF9900,
+        fields=[
+            ("Member", f"{member.mention} ({member})"),
+            ("Kicked by", ctx.author.mention),
+            ("Reason", reason),
+        ],
+    )
 
 
 @bot.bridge_command(name="ban")
@@ -131,6 +181,18 @@ async def ban(ctx, member: discord.Member, *, reason="No reason provided"):
         await ctx.respond(f"banned {member.mention}. Reason: {reason}")
     except discord.Forbidden:
         await ctx.respond("no perms to ban that user")
+        return
+
+    await post_mod_log(
+        ctx,
+        title="Member Banned",
+        color=0xFF0000,
+        fields=[
+            ("Member", f"{member.mention} ({member})"),
+            ("Banned by", ctx.author.mention),
+            ("Reason", reason),
+        ],
+    )
 
 
 @bot.bridge_command(name="mute")
@@ -157,6 +219,19 @@ async def mute(
         await ctx.respond(f"Muted {member.mention} for {duration}. Reason: {reason}")
     except discord.Forbidden:
         await ctx.respond("No perms to timeout that user")
+        return
+
+    await post_mod_log(
+        ctx,
+        title="Member Muted",
+        color=0xFFCC00,
+        fields=[
+            ("Member", f"{member.mention} ({member})"),
+            ("Duration", duration),
+            ("Muted by", ctx.author.mention),
+            ("Reason", reason),
+        ],
+    )
 
 
 @bot.bridge_command(name="unmute")
@@ -167,6 +242,17 @@ async def unmute(ctx, member: discord.Member):
         await ctx.respond(f"Unmuted {member.mention}.")
     except discord.Forbidden:
         await ctx.respond("No perms to unmute that user")
+        return
+
+    await post_mod_log(
+        ctx,
+        title="Member Unmuted",
+        color=0x00CC66,
+        fields=[
+            ("Member", f"{member.mention} ({member})"),
+            ("Unmuted by", ctx.author.mention),
+        ],
+    )
 
 
 @bot.bridge_command(name="unban")
@@ -208,6 +294,16 @@ async def unban(ctx, *, user: str):
 
     await ctx.guild.unban(match.user, reason=f"Unbanned by {ctx.author}")
     await ctx.respond(f"Unbanned {match.user}.")
+
+    await post_mod_log(
+        ctx,
+        title="Member Unbanned",
+        color=0x00CC66,
+        fields=[
+            ("Member", str(match.user)),
+            ("Unbanned by", ctx.author.mention),
+        ],
+    )
 
 
 @bot.bridge_command(name="userinfo")
@@ -282,7 +378,7 @@ async def setlogchannel(ctx, channel: discord.TextChannel = None):
     channel = channel or ctx.channel
     log_channels[str(ctx.guild.id)] = channel.id
     save_json(LOG_CHANNEL_FILE, log_channels)
-    await ctx.respond(f"Warn logs will be posted in {channel.mention}")
+    await ctx.respond(f"Moderation logs will be posted in {channel.mention}")
 
 
 @bot.bridge_command(name="warn")
@@ -290,33 +386,23 @@ async def setlogchannel(ctx, channel: discord.TextChannel = None):
 async def warn(ctx, member: discord.Member, *, reason="No reason provided"):
     # warns aren't persisted anywhere, just posted to the log channel.
     # good enough for now, might add a proper warn history later
-    log_channel_id = log_channels.get(str(ctx.guild.id))
-    if log_channel_id is None:
+    log_channel = get_log_channel(ctx)
+    if log_channel is None:
         await ctx.respond(
             "No log channel set yet, use `e!setlogchannel #channel` first"
         )
         return
 
-    log_channel = ctx.guild.get_channel(log_channel_id)
-    if log_channel is None:
-        await ctx.respond(
-            "Configured log channel no longer exists, set a new one with `e!setlogchannel`"
-        )
-        return
-
-    embed = discord.Embed(title="Member Warned", color=0xFFCC00)
-    embed.add_field(name="Member", value=f"{member.mention} ({member})", inline=False)
-    embed.add_field(name="Warned by", value=ctx.author.mention, inline=False)
-    embed.add_field(name="Reason", value=reason, inline=False)
-    embed.timestamp = discord.utils.utcnow()
-
-    try:
-        await log_channel.send(embed=embed)
-    except discord.Forbidden:
-        await ctx.respond(
-            "Couldn't post in the log channel, check my permissions there"
-        )
-        return
+    await post_mod_log(
+        ctx,
+        title="Member Warned",
+        color=0xFFCC00,
+        fields=[
+            ("Member", f"{member.mention} ({member})"),
+            ("Warned by", ctx.author.mention),
+            ("Reason", reason),
+        ],
+    )
 
     await ctx.respond(f"Warned {member.mention}. Logged in {log_channel.mention}.")
 
@@ -488,7 +574,7 @@ async def cmds(ctx):
     )
     embed.add_field(
         name=f"{prefix}setlogchannel [#channel]",
-        value="Manage Server required, sets where warns are posted",
+        value="Manage Server required, sets where mod actions (warn/kick/ban/mute/unmute/unban/clear) are logged",
         inline=False,
     )
     embed.add_field(
