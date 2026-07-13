@@ -5,6 +5,7 @@ A clean, reliable, and high-performance Discord bot built with **Py-Cord** desig
 ## 🚀 Features
 
 *   **⚡ High-Speed Utilities:** Instantly check bot latency and performance metrics.
+*   **🔧 Configurable Prefix:** Set a custom command prefix per server, persisted across restarts.
 *   **🛡️ Robust Moderation:** Advanced tools for message purging, kicking, banning, and comprehensive unbanning matching (handles raw IDs, Mentions, usernames, and legacy tags).
 *   **📊 Interactive Polls:** Create flexible voting setups supporting up to 10 custom options with automatic emoji reactions, or fallback to simple binary (👍/👎) votes.
 *   **⏰ Smart Reminders:** Background task scheduling using asynchronous relative time strings (e.g., `10m`, `1h30m`) that run concurrently without blocking bot processes.
@@ -40,6 +41,9 @@ Create a `.env` file in the root directory of your project to securely store you
 DISCORD_TOKEN=your_secret_bot_token_here
 ```
 
+### 4. Prefix Storage
+On first run, the bot creates a `prefixes.json` file alongside the script to track any custom prefixes set per server. Make sure the bot's working directory is writable, and note that this file needs to persist across deploys/restarts (a wipeable filesystem, e.g. some free hosting tiers, will reset all servers back to the default prefix).
+
 ---
 
 ## 💻 Running the Bot
@@ -53,12 +57,14 @@ python main.py
 
 ## 📜 Command Reference
 
-The default command prefix is `e!`.
+The default command prefix is `e!`, but it can be changed per server — see `e!setprefix` below. The bot also always responds when mentioned, regardless of the configured prefix.
 
 | Command | Arguments | Permissions Required | Description |
 | :--- | :--- | :--- | :--- |
-| `e!cmds` | None | None | Displays a clean help embed containing all active commands. |
+| `e!cmds` | None | None | Displays a clean help embed containing all active commands, using the server's current prefix. |
 | `e!ping` | None | None | Checks the current gateway websocket latency. |
+| `e!setprefix` | `[new_prefix]` | **Manage Server** | Sets a custom prefix for this server (5 characters max). Run with no argument to see the current prefix. |
+| `e!resetprefix` | None | **Manage Server** | Resets this server's prefix back to the default (`e!`). |
 | `e!userinfo` | `[@member]` | None | Displays profile details, creation dates, join dates, and top roles. Defaults to self. |
 | `e!serverinfo` | None | None | Renders server context including owner, member metrics, and setup timestamps. |
 | `e!roleinfo` | `<@role / name>` | None | Returns role ID, position hierarchy, member distribution, and full permissions. |
@@ -73,6 +79,7 @@ The default command prefix is `e!`.
 
 ## ⚙️ Architecture Notes
 
+*   **Per-Guild Prefix Resolution:** Prefixes are resolved dynamically per message via a `get_prefix` callable rather than a single static value, keyed off each server's ID and stored in `prefixes.json`. Servers without a custom entry fall back to the default `e!`.
 *   **Asynchronous Tasks:** The reminder tracking module leverages `asyncio.sleep` running natively within the `bot.loop` context. This avoids blocking active event handling queues across concurrent guilds.
 *   **Self-Cleaning Mod Loops:** Contextual confirmations (like message totals purged via `e!clear`) automatically delete their tracking messages after a 5-second interval to eliminate administrative layout spam.
 *   **Robust Lookups:** The `e!unban` engine parses string sequences dynamically through multi-layer regex evaluations, ensuring high matching precision without relying on local cache stores.
