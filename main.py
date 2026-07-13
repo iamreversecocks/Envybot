@@ -603,6 +603,66 @@ async def cmds(ctx):
 
 
 @bot.event
+async def on_message_delete(message: discord.Message):
+    # ignore dms
+    if not message.guild:
+        return
+
+    if message.author and message.author.bot:
+        return
+
+    log_channel_id = log_channels.get(str(message.guild.id))
+    if not log_channel_id:
+        return
+
+    log_channel = message.guild.get_channel(log_channel_id)
+    if not log_channel:
+        return
+
+    # logging embed
+    embed = discord.Embed(
+        title="Message Deleted",
+        color=0xFF0000,  # Red
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.set_footer(
+        text=f"Author ID: {message.author.id if message.author else 'Unknown'}"
+    )
+
+    if message.content or message.attachments:
+        embed.set_author(
+            name=str(message.author), icon_url=message.author.display_avatar.url
+        )
+        embed.add_field(name="Channel", value=message.channel.mention, inline=True)
+        embed.add_field(name="Author", value=message.author.mention, inline=True)
+
+        if message.content:
+            content = (
+                message.content[:1000] + "..."
+                if len(message.content) > 1000
+                else message.content
+            )
+            embed.add_field(name="Content", value=content, inline=False)
+
+        if message.attachments:
+            filenames = ", ".join([att.filename for att in message.attachments])
+            embed.add_field(name="Attachments", value=f"📁 {filenames}", inline=False)
+
+    else:
+        embed.description = (
+            "message was deleted but it was sent before bot was on "
+            "or pushed out of the temp message cache"
+        )
+        embed.add_field(name="Channel", value=message.channel.mention, inline=False)
+
+    try:
+        await log_channel.send(embed=embed)
+    except discord.Forbidden:
+        # silent fail
+        pass
+
+
+@bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send(f"missing perms: {', '.join(error.missing_permissions)}")
