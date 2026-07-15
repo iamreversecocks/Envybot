@@ -1,8 +1,8 @@
 import asyncio
-import json
 import os
 import re
-from datetime import timedelta
+from collections import defaultdict, deque
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiosqlite
@@ -17,25 +17,11 @@ if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN not found in the .env file")
 
 DEFAULT_PREFIX = "e!"
-PREFIX_FILE = Path(__file__).parent / "prefixes.json"
-LOG_CHANNEL_FILE = Path(__file__).parent / "log_channels.json"
 DB_FILE = Path(__file__).parent / "reminders.db"
 
-
-def load_json(path, default):
-    if not path.exists():
-        return default
-    with open(path, "r") as f:
-        return json.load(f)
-
-
-def save_json(path, data):
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-
-
-prefixes = load_json(PREFIX_FILE, {})
-log_channels = load_json(LOG_CHANNEL_FILE, {})
+# Guild Caches
+prefixes = {}
+log_channels = {}
 
 
 def get_prefix(bot_, message):
@@ -49,13 +35,19 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-# prob not needed but doesnt hurt to have it in
-try:
-    asyncio.get_event_loop()
-except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
-
 bot = bridge.Bot(command_prefix=get_prefix, intents=intents)
+
+
+SPAM_WINDOW_SECONDS = 6
+SPAM_MESSAGE_THRESHOLD = 5
+SPAM_MUTE_SECONDS = 60
+recent_messages = defaultdict(
+    deque
+)  # NOTE: stores message timestamps per member {member_id: deque([timestamps])}
+
+
+WARN_MUTE_THRESHOLD = 3
+WARN_MUTE_SECONDS = 600
 
 
 @bot.bridge_command(name="ping")
@@ -79,7 +71,7 @@ async def setprefix(ctx, new_prefix: str = None):
         return
 
     prefixes[str(ctx.guild.id)] = new_prefix
-    save_json(PREFIX_FILE, prefixes)
+    await upsert_guild_setting(ctx.guild.id, prefix=new_prefix)
     await ctx.respond(f"prefix is now `{new_prefix}`")
 
 
@@ -87,7 +79,7 @@ async def setprefix(ctx, new_prefix: str = None):
 @commands.has_permissions(manage_guild=True)
 async def resetprefix(ctx):
     prefixes.pop(str(ctx.guild.id), None)
-    save_json(PREFIX_FILE, prefixes)
+    await clear_guild_prefix(ctx.guild.id)
     await ctx.respond(f"back to default (`{DEFAULT_PREFIX}`)")
 
 
@@ -99,9 +91,6 @@ def get_log_channel(ctx):
 
 
 async def post_mod_log(ctx, *, title, color, fields):
-    """Best-effort post of a moderation action embed to the configured log channel.
-    Silently does nothing if no log channel is set or the bot can't post there.
-    """
     channel = get_log_channel(ctx)
     if channel is None:
         return
@@ -130,10 +119,7 @@ async def clear(ctx, amount: int = 5):
             f"Deleted {len(deleted)} messages.", ephemeral=True, delete_after=5
         )
     else:
-        # +1 so the command eats itself
         deleted = await ctx.channel.purge(limit=amount + 1)
-        # can't ctx.respond() here - it replies to the invoking message,
-        # which we just purged, so Discord rejects the reference
         msg = await ctx.channel.send(f"Deleted {len(deleted) - 1} messages.")
         await msg.delete(delay=5)
 
@@ -209,8 +195,6 @@ async def mute(
     if not seconds:
         await ctx.respond("couldn't parse that, try `10m` or `1h30m`")
         return
-
-    # discord's hard limit on timeouts is 28 days
     if seconds > 2419200:
         seconds = 2419200
 
@@ -256,7 +240,7 @@ async def unmute(ctx, member: discord.Member):
     )
 
 
-@bot.bridge_command(name="unban")
+@bot.bridge_command(name="unban")  # TODO: Optimize this
 @commands.has_permissions(ban_members=True)
 async def unban(ctx, *, user: str):
     banned = [entry async for entry in ctx.guild.bans()]
@@ -378,34 +362,120 @@ async def roleinfo(ctx, *, role: discord.Role):
 async def setlogchannel(ctx, channel: discord.TextChannel = None):
     channel = channel or ctx.channel
     log_channels[str(ctx.guild.id)] = channel.id
-    save_json(LOG_CHANNEL_FILE, log_channels)
-    await ctx.respond(f"Moderation logs will be posted in {channel.mention}")
+    await upsert_guild_setting(ctx.guild.id, log_channel_id=channel.id)
+    await ctx.respond(f"modlogs will be posted in {channel.mention}")
 
 
 @bot.bridge_command(name="warn")
 @commands.has_permissions(moderate_members=True)
 async def warn(ctx, member: discord.Member, *, reason="No reason provided"):
-    # warns aren't persisted anywhere, just posted to the log channel.
-    # good enough for now, might add a proper warn history later
     log_channel = get_log_channel(ctx)
-    if log_channel is None:
-        await ctx.respond(
-            "No log channel set yet, use `e!setlogchannel #channel` first"
+    if not log_channel:
+        return await ctx.respond("no log channel set use {prefix}setlogchannel")
+
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            """INSERT INTO warnings (guild_id, user_id, moderator_id, reason, created_at) 
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                ctx.guild.id,
+                member.id,
+                ctx.author.id,
+                reason,
+                discord.utils.utcnow().timestamp(),
+            ),
         )
-        return
+        await db.commit()
+
+        async with db.execute(
+            "SELECT COUNT(*) FROM warnings WHERE guild_id = ? AND user_id = ?",
+            (ctx.guild.id, member.id),
+        ) as cursor:
+            (warning_count,) = await cursor.fetchone()
 
     await post_mod_log(
         ctx,
-        title="Member Warned",
+        title="user Warned",
         color=0xFFCC00,
         fields=[
-            ("Member", f"{member.mention} ({member})"),
+            ("user", f"{member.mention} ({member})"),
             ("Warned by", ctx.author.mention),
             ("Reason", reason),
+            ("Total Warnings", str(warning_count)),
         ],
     )
 
-    await ctx.respond(f"Warned {member.mention}. Logged in {log_channel.mention}.")
+    response = f"warned {member.mention} ({warning_count} total)."
+
+    if warning_count >= WARN_MUTE_THRESHOLD and member != ctx.author:
+        try:
+            until = discord.utils.utcnow() + timedelta(seconds=WARN_MUTE_SECONDS)
+            await member.timeout(
+                until, reason=f"Auto-mute: reached {warning_count} warnings"
+            )
+
+            response += f"\nAuto-muted for {WARN_MUTE_SECONDS // 60}m."
+            await post_mod_log(
+                ctx,
+                title="user automuted",
+                color=0xFF6600,
+                fields=[
+                    ("user", f"{member.mention} ({member})"),
+                    ("Reason", f"Reached {warning_count} warnings"),
+                ],
+            )
+        except discord.Forbidden:
+            response += "\n*failed to automute check perms.*"
+
+    await ctx.respond(response)
+
+
+@bot.bridge_command(name="warnings")
+@commands.has_permissions(moderate_members=True)
+async def warnings_cmd(ctx, member: discord.Member):
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, moderator_id, reason, created_at FROM warnings "
+            "WHERE guild_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT 10",
+            (ctx.guild.id, member.id),
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+    if not rows:
+        await ctx.respond(f"{member.mention} has no warnings.")
+        return
+
+    embed = discord.Embed(title=f"Warnings for {member}", color=0xFFCC00)
+    for row in rows:
+        mod = ctx.guild.get_member(row["moderator_id"])
+        mod_name = mod.mention if mod else f"<@{row['moderator_id']}>"
+        when = discord.utils.format_dt(
+            datetime.fromtimestamp(row["created_at"], tz=timezone.utc), style="R"
+        )
+        embed.add_field(
+            name=f"#{row['id']} — {when}",
+            value=f"By {mod_name}: {row['reason']}",
+            inline=False,
+        )
+    await ctx.respond(embed=embed)
+
+
+@bot.bridge_command(name="delwarning")
+@commands.has_permissions(manage_guild=True)
+async def delwarning(ctx, warning_id: int):
+    async with aiosqlite.connect(DB_FILE) as db:
+        cursor = await db.execute(
+            "DELETE FROM warnings WHERE id = ? AND guild_id = ?",
+            (warning_id, ctx.guild.id),
+        )
+        await db.commit()
+
+    if cursor.rowcount == 0:
+        await ctx.respond(f"no warning with id `{warning_id}` in this server")
+        return
+
+    await ctx.respond(f"Deleted warning `{warning_id}`.")
 
 
 @bot.bridge_command(name="slowmode")
@@ -428,6 +498,7 @@ NUMBERS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7�
 
 
 @bot.bridge_command(name="poll")
+@commands.cooldown(1, 15, commands.BucketType.user)
 async def poll(
     ctx,
     question: str,
@@ -479,7 +550,7 @@ def parse_duration(text):
 
 
 async def init_db():
-    """Create the reminders table if it doesn't already exist."""
+    """Create all tables if they don't already exist."""
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(
             """
@@ -492,10 +563,83 @@ async def init_db():
             )
             """
         )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS guild_settings (
+                guild_id INTEGER PRIMARY KEY,
+                prefix TEXT,
+                log_channel_id INTEGER
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS warnings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                moderator_id INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reaction_roles (
+                guild_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                emoji TEXT NOT NULL,
+                role_id INTEGER NOT NULL,
+                PRIMARY KEY (message_id, emoji)
+            )
+            """
+        )
+        await db.commit()
+
+
+async def load_guild_settings():
+    """Populate the in-memory prefix/log-channel caches from the db."""
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT guild_id, prefix, log_channel_id FROM guild_settings"
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+    for row in rows:
+        if row["prefix"]:
+            prefixes[str(row["guild_id"])] = row["prefix"]
+        if row["log_channel_id"]:
+            log_channels[str(row["guild_id"])] = row["log_channel_id"]
+
+
+async def upsert_guild_setting(guild_id, *, prefix=None, log_channel_id=None):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT INTO guild_settings (guild_id, prefix, log_channel_id) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET "
+            "prefix = COALESCE(excluded.prefix, prefix), "
+            "log_channel_id = COALESCE(excluded.log_channel_id, log_channel_id)",
+            (guild_id, prefix, log_channel_id),
+        )
+        await db.commit()
+
+
+async def clear_guild_prefix(guild_id):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT INTO guild_settings (guild_id, prefix, log_channel_id) "
+            "VALUES (?, NULL, NULL) "
+            "ON CONFLICT(guild_id) DO UPDATE SET prefix = NULL",
+            (guild_id,),
+        )
         await db.commit()
 
 
 @bot.bridge_command(name="reminder", aliases=["remindme"])
+@commands.cooldown(1, 10, commands.BucketType.user)
 async def reminder(ctx, duration: str, *, message: str = "Reminder!"):
     seconds = parse_duration(duration)
     if not seconds:
@@ -509,14 +653,62 @@ async def reminder(ctx, duration: str, *, message: str = "Reminder!"):
     fire_at = discord.utils.utcnow().timestamp() + seconds
 
     async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute(
+        cursor = await db.execute(
             "INSERT INTO reminders (user_id, channel_id, fire_at, message) "
             "VALUES (?, ?, ?, ?)",
             (ctx.author.id, ctx.channel.id, fire_at, message),
         )
         await db.commit()
+        reminder_id = cursor.lastrowid
 
-    await ctx.respond(f"ok, reminding you in {duration}")
+    await ctx.respond(
+        f"ok, reminding you in {duration} (id `{reminder_id}`, "
+        f"`{prefixes.get(str(ctx.guild.id), DEFAULT_PREFIX) if ctx.guild else DEFAULT_PREFIX}delreminder {reminder_id}` to cancel)"
+    )
+
+
+@bot.bridge_command(name="reminders")
+async def list_reminders(ctx):
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, fire_at, message FROM reminders WHERE user_id = ? "
+            "ORDER BY fire_at ASC",
+            (ctx.author.id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+    if not rows:
+        await ctx.respond("you have no pending reminders")
+        return
+
+    lines = []
+    for row in rows:
+        when = discord.utils.format_dt(
+            datetime.fromtimestamp(row["fire_at"], tz=timezone.utc), style="R"
+        )
+        lines.append(f"`{row['id']}` — {when}: {row['message']}")
+
+    embed = discord.Embed(
+        title="Your Reminders", description="\n".join(lines), color=0x5865F2
+    )
+    await ctx.respond(embed=embed)
+
+
+@bot.bridge_command(name="delreminder")
+async def delreminder(ctx, reminder_id: int):
+    async with aiosqlite.connect(DB_FILE) as db:
+        cursor = await db.execute(
+            "DELETE FROM reminders WHERE id = ? AND user_id = ?",
+            (reminder_id, ctx.author.id),
+        )
+        await db.commit()
+
+    if cursor.rowcount == 0:
+        await ctx.respond(f"no reminder with id `{reminder_id}` belonging to you")
+        return
+
+    await ctx.respond(f"cancelled reminder `{reminder_id}`.")
 
 
 @tasks.loop(seconds=10)
@@ -597,12 +789,23 @@ async def cmds(ctx):
     )
     embed.add_field(
         name=f"{prefix}warn @member [reason]",
-        value="Moderate Members required, posts to the log channel (not stored)",
+        value="Moderate Members required, logged + stored, auto-mutes at "
+        f"{WARN_MUTE_THRESHOLD} warnings",
+        inline=False,
+    )
+    embed.add_field(
+        name=f"{prefix}warnings @member",
+        value="Moderate Members required, shows a member's last 10 warnings",
+        inline=False,
+    )
+    embed.add_field(
+        name=f"{prefix}delwarning <id>",
+        value="Manage Server required, deletes a single warning",
         inline=False,
     )
     embed.add_field(
         name=f"{prefix}setlogchannel [#channel]",
-        value="Manage Server required, sets where mod actions (warn/kick/ban/mute/unmute/unban/clear) are logged",
+        value="Manage Server required, sets where mod actions are logged",
         inline=False,
     )
     embed.add_field(
@@ -618,12 +821,27 @@ async def cmds(ctx):
     embed.add_field(name=f"{prefix}serverinfo", value="", inline=False)
     embed.add_field(name=f"{prefix}roleinfo <role>", value="", inline=False)
     embed.add_field(
-        name=f'{prefix}poll "q" ["opt"...]',
-        value="no options = thumbs up/down, up to 10 options",
+        name=f"{prefix}reactionrole <message_id> <emoji> <role>",
+        value="Manage Roles required, sets up self-assignable roles via reactions",
         inline=False,
     )
     embed.add_field(
-        name=f"{prefix}reminder <10m/2h/1d> <msg>", value="30 day max", inline=False
+        name=f'{prefix}poll "q" ["opt"...]',
+        value="no options = thumbs up/down, up to 10 options, 15s cooldown",
+        inline=False,
+    )
+    embed.add_field(
+        name=f"{prefix}reminder <10m/2h/1d> <msg>",
+        value="30 day max, 10s cooldown",
+        inline=False,
+    )
+    embed.add_field(
+        name=f"{prefix}reminders", value="lists your pending reminders", inline=False
+    )
+    embed.add_field(
+        name=f"{prefix}delreminder <id>",
+        value="cancels one of your reminders",
+        inline=False,
     )
     await ctx.respond(embed=embed)
 
@@ -645,7 +863,6 @@ async def on_message_delete(message: discord.Message):
     if not log_channel:
         return
 
-    # logging embed
     embed = discord.Embed(
         title="Message Deleted",
         color=0xFF0000,  # Red
@@ -679,15 +896,176 @@ async def on_message_delete(message: discord.Message):
             "message was deleted but it was sent before bot was on "
             "or pushed out of the temp message cache"
         )
-        embed.add_field(name="Channel", value=message.channel.mention, inline=False)
+        embed.add_field(name="channel", value=message.channel.mention, inline=False)
 
     try:
         await log_channel.send(embed=embed)
     except discord.Forbidden:
-        # silent fail
         pass
 
 
+@bot.bridge_command(name="reactionrole")
+@commands.has_permissions(manage_roles=True)
+async def reactionrole(ctx, message_id: str, emoji: str, role: discord.Role):
+    try:
+        message_id = int(message_id)
+    except ValueError:
+        await ctx.respond("that doesn't look like a message id")
+        return
+
+    if role >= ctx.guild.me.top_role:
+        await ctx.respond("that role is above my highest role")
+        return
+
+    target = None
+    for channel in ctx.guild.text_channels:
+        try:
+            target = await channel.fetch_message(message_id)
+            break
+        except (discord.NotFound, discord.Forbidden):
+            continue
+
+    if target is None:
+        await ctx.respond("couldn't find a message with that id")
+        return
+
+    try:
+        await target.add_reaction(emoji)
+    except discord.HTTPException:
+        await ctx.respond("that isnt an emoji")
+        return
+
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT INTO reaction_roles (guild_id, message_id, emoji, role_id) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(message_id, emoji) DO UPDATE SET role_id = excluded.role_id",
+            (ctx.guild.id, message_id, emoji, role.id),
+        )
+        await db.commit()
+
+    await ctx.respond(
+        f"reacting with {emoji} on that message now grants {role.mention}."
+    )
+
+
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    if payload.member is None or payload.member.bot:
+        return
+
+    role_id = await get_reaction_role(payload.message_id, str(payload.emoji))
+    if role_id is None:
+        return
+
+    role = payload.member.guild.get_role(role_id)
+    if role is None:
+        return
+
+    try:
+        await payload.member.add_roles(role, reason="Reaction role")
+    except discord.Forbidden:
+        pass
+
+
+@bot.event
+async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
+    guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
+    if guild is None:
+        return
+
+    role_id = await get_reaction_role(payload.message_id, str(payload.emoji))
+    if role_id is None:
+        return
+
+    role = guild.get_role(role_id)
+    member = guild.get_member(payload.user_id)
+    if role is None or member is None:
+        return
+
+    try:
+        await member.remove_roles(role, reason="Reaction role removed")
+    except discord.Forbidden:
+        pass
+
+
+async def get_reaction_role(message_id: int, emoji: str):
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT role_id FROM reaction_roles WHERE message_id = ? AND emoji = ?",
+            (message_id, emoji),
+        ) as cursor:
+            row = await cursor.fetchone()
+    return row[0] if row else None
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.guild and not message.author.bot:
+        key = (message.guild.id, message.author.id)
+        now = discord.utils.utcnow().timestamp()
+        dq = recent_messages[key]
+        dq.append(now)
+        while dq and now - dq[0] > SPAM_WINDOW_SECONDS:
+            dq.popleft()
+
+        if len(dq) >= SPAM_MESSAGE_THRESHOLD:
+            dq.clear()
+            member = message.author
+            if (
+                isinstance(member, discord.Member)
+                and not member.guild_permissions.manage_messages
+            ):
+                try:
+                    until = discord.utils.utcnow() + timedelta(
+                        seconds=SPAM_MUTE_SECONDS
+                    )
+                    await member.timeout(until, reason="Automatic: message spam")
+                    warning = await message.channel.send(
+                        f"{member.mention} muted for {SPAM_MUTE_SECONDS}s (spam detected)"
+                    )
+                    await warning.delete(delay=5)
+                except discord.Forbidden:
+                    pass
+
+    await bot.process_commands(message)
+
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    if not before.guild or (before.author and before.author.bot):
+        return
+    if before.content == after.content:
+        return
+
+    log_channel_id = log_channels.get(str(before.guild.id))
+    if not log_channel_id:
+        return
+
+    log_channel = before.guild.get_channel(log_channel_id)
+    if not log_channel:
+        return
+
+    embed = discord.Embed(
+        title="Message Edited", color=0xFFAA00, timestamp=discord.utils.utcnow()
+    )
+    embed.set_author(name=str(before.author), icon_url=before.author.display_avatar.url)
+    embed.add_field(name="Channel", value=before.channel.mention, inline=True)
+    embed.add_field(name="Author", value=before.author.mention, inline=True)
+    embed.add_field(name="Jump", value=f"[link]({after.jump_url})", inline=True)
+
+    old_content = before.content[:1000] if before.content else "*(none)*"
+    new_content = after.content[:1000] if after.content else "*(none)*"
+    embed.add_field(name="Before", value=old_content, inline=False)
+    embed.add_field(name="After", value=new_content, inline=False)
+
+    try:
+        await log_channel.send(embed=embed)
+    except discord.Forbidden:
+        pass
+
+
+# TODO: Implement proper logging framework instead of printing
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
@@ -696,6 +1074,8 @@ async def on_command_error(ctx, error):
         await ctx.send(f"missing argument: {error.param.name}")
     elif isinstance(error, commands.BadArgument):
         await ctx.send("couldn't find that user/role")
+    elif isinstance(error, commands.CommandOnCooldown):
+        await ctx.send(f"slow down, try again in {error.retry_after:.1f}s")
     elif isinstance(error, commands.CommandNotFound):
         pass
     else:
@@ -711,6 +1091,10 @@ async def on_application_command_error(ctx, error):
         )
     elif isinstance(error, commands.BadArgument):
         await ctx.respond("couldn't find that user/role", ephemeral=True)
+    elif isinstance(error, commands.CommandOnCooldown):
+        await ctx.respond(
+            f"slow down, try again in {error.retry_after:.1f}s", ephemeral=True
+        )
     else:
         print(error)
         await ctx.respond("something broke", ephemeral=True)
@@ -721,9 +1105,20 @@ async def on_ready():
     print(f"logged in as {bot.user}")
 
     await init_db()
+    await load_guild_settings()
 
     if not check_reminders.is_running():
         check_reminders.start()
 
 
-bot.run(DISCORD_TOKEN)
+async def main():
+    async with bot:
+        await bot.start(DISCORD_TOKEN)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+# git commit -m "Resolving a race condition in my life choices"
