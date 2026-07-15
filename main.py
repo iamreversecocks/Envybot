@@ -2,12 +2,12 @@ import asyncio
 import json
 import os
 import re
-import uuid
 from datetime import timedelta
 from pathlib import Path
 
+import aiosqlite
 import discord
-from discord.ext import bridge, commands
+from discord.ext import bridge, commands, tasks
 from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
@@ -19,7 +19,7 @@ if not DISCORD_TOKEN:
 DEFAULT_PREFIX = "e!"
 PREFIX_FILE = Path(__file__).parent / "prefixes.json"
 LOG_CHANNEL_FILE = Path(__file__).parent / "log_channels.json"
-REMINDER_FILE = Path(__file__).parent / "reminders.json"
+DB_FILE = Path(__file__).parent / "reminders.db"
 
 
 def load_json(path, default):
@@ -36,7 +36,6 @@ def save_json(path, data):
 
 prefixes = load_json(PREFIX_FILE, {})
 log_channels = load_json(LOG_CHANNEL_FILE, {})
-reminders = load_json(REMINDER_FILE, [])
 
 
 def get_prefix(bot_, message):
@@ -479,25 +478,21 @@ def parse_duration(text):
     return total
 
 
-def schedule_reminder(entry):
-    delay = max(entry["fire_at"] - discord.utils.utcnow().timestamp(), 0)
-
-    async def wait_and_remind():
-        await asyncio.sleep(delay)
-
-        channel = bot.get_channel(entry["channel_id"])
-        if channel is not None:
-            try:
-                await channel.send(
-                    f"<@{entry['user_id']}> reminder: {entry['message']}"
-                )
-            except discord.Forbidden:
-                pass
-
-        reminders[:] = [r for r in reminders if r["id"] != entry["id"]]
-        save_json(REMINDER_FILE, reminders)
-
-    bot.loop.create_task(wait_and_remind())
+async def init_db():
+    """Create the reminders table if it doesn't already exist."""
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reminders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                fire_at REAL NOT NULL,
+                message TEXT NOT NULL
+            )
+            """
+        )
+        await db.commit()
 
 
 @bot.bridge_command(name="reminder", aliases=["remindme"])
@@ -511,18 +506,49 @@ async def reminder(ctx, duration: str, *, message: str = "Reminder!"):
         await ctx.respond("30 days max")
         return
 
-    entry = {
-        "id": str(uuid.uuid4()),
-        "user_id": ctx.author.id,
-        "channel_id": ctx.channel.id,
-        "fire_at": discord.utils.utcnow().timestamp() + seconds,
-        "message": message,
-    }
-    reminders.append(entry)
-    save_json(REMINDER_FILE, reminders)
+    fire_at = discord.utils.utcnow().timestamp() + seconds
+
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT INTO reminders (user_id, channel_id, fire_at, message) "
+            "VALUES (?, ?, ?, ?)",
+            (ctx.author.id, ctx.channel.id, fire_at, message),
+        )
+        await db.commit()
 
     await ctx.respond(f"ok, reminding you in {duration}")
-    schedule_reminder(entry)
+
+
+@tasks.loop(seconds=10)
+async def check_reminders():
+    now = discord.utils.utcnow().timestamp()
+
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM reminders WHERE fire_at <= ?", (now,)
+        ) as cursor:
+            expired = await cursor.fetchall()
+
+        for row in expired:
+            channel = bot.get_channel(row["channel_id"])
+            if channel is not None:
+                try:
+                    await channel.send(
+                        f"<@{row['user_id']}> reminder: {row['message']}"
+                    )
+                except discord.Forbidden:
+                    pass
+
+            await db.execute("DELETE FROM reminders WHERE id = ?", (row["id"],))
+
+        await db.commit()
+
+
+@check_reminders.before_loop
+async def before_check_reminders():
+    # don't start hitting channels/db until the bot is fully connected
+    await bot.wait_until_ready()
 
 
 @bot.bridge_command(name="cmds")
@@ -646,7 +672,7 @@ async def on_message_delete(message: discord.Message):
 
         if message.attachments:
             filenames = ", ".join([att.filename for att in message.attachments])
-            embed.add_field(name="Attachments", value=f"📁 {filenames}", inline=False)
+            embed.add_field(name="Attachments", value=f"{filenames}", inline=False)
 
     else:
         embed.description = (
@@ -694,13 +720,10 @@ async def on_application_command_error(ctx, error):
 async def on_ready():
     print(f"logged in as {bot.user}")
 
-    # Wait until the internal cache is fully loaded
-    await bot.wait_until_ready()
+    await init_db()
 
-    for entry in list(reminders):
-        schedule_reminder(entry)
-    if reminders:
-        print(f"rescheduled {len(reminders)} pending reminder(s)")
+    if not check_reminders.is_running():
+        check_reminders.start()
 
 
 bot.run(DISCORD_TOKEN)
