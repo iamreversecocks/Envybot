@@ -550,7 +550,7 @@ def parse_duration(text):
 
 
 async def init_db():
-    """Create all tables if they don't already exist."""
+    """create tables"""
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(
             """
@@ -599,7 +599,7 @@ async def init_db():
 
 
 async def load_guild_settings():
-    """Populate the in-memory prefix/log-channel caches from the db."""
+    """x."""
     async with aiosqlite.connect(DB_FILE) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
